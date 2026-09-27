@@ -82,6 +82,27 @@ final class NativeSilentGroup {
                 else p.setResult(1);
             }
         });
+        hook(P + "stack.NotificationChildrenContainer", "onMeasure", new Hooks.Callback() {
+            @Override protected void afterHookedMethod(MethodHookParam p) {
+                if (!p.hasThrowable() && ownContainer(p.thisObject)) {
+                    measureRemainingChildren((ViewGroup) p.thisObject, (Integer) p.args[0], (Integer) p.args[1]);
+                }
+            }
+        });
+        hook(P + "stack.NotificationChildrenContainer", "onLayout", new Hooks.Callback() {
+            @Override protected void afterHookedMethod(MethodHookParam p) {
+                if (p.hasThrowable() || !ownContainer(p.thisObject)) return;
+                ViewGroup container = (ViewGroup) p.thisObject;
+                List<?> attached = list(field(container, "mAttachedChildren"));
+                List<?> dividers = list(field(container, "mDividers"));
+                int dividerHeight = Reflect.getIntField(container, "mDividerHeight");
+                for (int i = 8; i < attached.size(); i++) {
+                    View child = (View) attached.get(i);
+                    child.layout(0, 0, child.getMeasuredWidth(), child.getMeasuredHeight());
+                    ((View) dividers.get(i)).layout(0, 0, container.getWidth(), dividerHeight);
+                }
+            }
+        });
         hook(P + "stack.NotificationChildrenContainer", "getCollapsedHeight", new Hooks.Callback() {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
                 if (ownContainer(p.thisObject)) p.setResult(dp((View)p.thisObject, 56));
@@ -151,6 +172,14 @@ final class NativeSilentGroup {
                 if (index != null) list(p.args[0]).add(Math.min(index,list(p.args[0]).size()),group);
             }
         });
+        hook(P + "collection.ShadeListBuilder", "maybeSuppressGroupChange", new Hooks.Callback() {
+            @Override protected void beforeHookedMethod(MethodHookParam p) {
+                if (group == null) return;
+                // The local render group is rebuilt each pass, outside the app grouping stage.
+                Object previous = call(call(p.args[0], "getPreviousAttachState"), "getParent");
+                if (previous == group || call(p.args[0], "getParent") == group) p.setResult(false);
+            }
+        });
         hook(overlay,"access$requestRebuildIfSingleChild",new Hooks.Callback() {
             @Override protected void beforeHookedMethod(MethodHookParam p) {
                 if (ownContainer(call(p.args[0],"getChildrenContainer"))) p.setResult(null);
@@ -200,17 +229,37 @@ final class NativeSilentGroup {
         List<Object> originals = new ArrayList<>();
         List<Object> leaves = new ArrayList<>();
         Object section = null;
+        List<Object> partialGroups = new ArrayList<>();
         for (Object item : list) {
             Object s = call(item, "getSection");
             if (s == null) continue;
             String name = (String) call(call(s, "getSectioner"), "getName");
-            if (!"Silent".equals(name) && !"Minimized".equals(name)) continue;
-            if (section == null) section = s;
-            originals.add(item);
-            if (item.getClass().getName().endsWith(".GroupEntry")) leaves.addAll(list(call(item, "getChildren")));
-            else leaves.add(item);
+            boolean silentSection = "Silent".equals(name) || "Minimized".equals(name);
+            if (!silentSection && !"Alerting".equals(name)) continue;
+            if (silentSection && section == null) section = s;
+            if (item.getClass().getName().endsWith(".GroupEntry")) {
+                List<Object> children = list(call(item, "getChildren"));
+                int start = leaves.size();
+                for (Object child : children) if (isSilent(child)) leaves.add(child);
+                int selected = leaves.size() - start;
+                if (selected == 0) continue;
+                if (selected == children.size()) originals.add(item);
+                else partialGroups.add(item);
+            } else if (silentSection && isSilent(item)) {
+                originals.add(item);
+                leaves.add(item);
+            }
         }
         if (leaves.isEmpty()) return;
+        if (section == null) {
+            for (Object candidate : list(field(listBuilder, "mNotifSections"))) {
+                if ("Silent".equals(call(call(candidate, "getSectioner"), "getName"))) {
+                    section = candidate;
+                    break;
+                }
+            }
+        }
+        if (section == null) return;
         ensureSummary(leaves.get(0));
         try { GUARD.createNewFile(); } catch (java.io.IOException error) { throw new IllegalStateException(error); }
         count = leaves.size();
@@ -238,9 +287,40 @@ final class NativeSilentGroup {
             call(call(leaf, "getAttachState"), "setSection", section);
             groupChildren.add(leaf);
         }
-        int position = list.indexOf(originals.get(0));
+        for (Object partial : partialGroups) list(call(partial, "getRawChildren")).removeAll(leaves);
+        int position = originals.isEmpty() ? list.size() : list.indexOf(originals.get(0));
         list.removeAll(originals);
         list.add(position, group);
+    }
+
+    private static boolean isSilent(Object entry) {
+        int importance = ((Number) call(call(entry, "getRanking"), "getImportance")).intValue();
+        return importance > 0 && importance < 3;
+    }
+
+    private static void measureRemainingChildren(ViewGroup container, int widthSpec, int heightSpec) {
+        List<Object> attached = list(field(container, "mAttachedChildren"));
+        // The native measure/layout loops stop after eight children.
+        if (attached.size() <= 8) return;
+        int mode = View.MeasureSpec.getMode(heightSpec);
+        int size = View.MeasureSpec.getSize(heightSpec);
+        int childHeightSpec = mode == View.MeasureSpec.UNSPECIFIED ? heightSpec
+            : View.MeasureSpec.makeMeasureSpec(size, View.MeasureSpec.AT_MOST);
+        int dividerHeight = Reflect.getIntField(container, "mDividerHeight");
+        int dividerSpec = View.MeasureSpec.makeMeasureSpec(dividerHeight, View.MeasureSpec.EXACTLY);
+        List<Object> dividers = list(field(container, "mDividers"));
+        int height = Reflect.getIntField(container, "mRealHeight");
+        for (int i = 8; i < attached.size(); i++) {
+            View child = (View) attached.get(i);
+            call(child, "setSingleLineWidthIndention", 0);
+            call(field(container, "mExt"), "updateSingleLinePadding", child, i);
+            child.measure(widthSpec, childHeightSpec);
+            ((View) dividers.get(i)).measure(widthSpec, dividerSpec);
+            if (child.getVisibility() != View.GONE) height += child.getMeasuredHeight() + dividerHeight;
+        }
+        Reflect.setIntField(container, "mRealHeight", height);
+        call(container, "setMeasuredDimension", View.MeasureSpec.getSize(widthSpec),
+            mode == View.MeasureSpec.UNSPECIFIED ? height : Math.min(height, size));
     }
 
     private static void ensureSummary(Object donor) {
