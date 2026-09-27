@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">notificationfold</string>
+    <string name="module_description">静默通知分区与整体折叠</string>
+</resources>

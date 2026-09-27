@@ -1,0 +1,76 @@
+name: Build APK
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK packages
+        run: |
+          & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" 'platforms;android-36' 'build-tools;36.0.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK installation failed.' }
+
+      - name: Install libxposed API
+        run: ./scripts/setup-xposed.ps1
+
+      - name: Build development APK
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/master'
+        run: ./build.ps1 -AndroidSdkRoot $env:ANDROID_HOME
+
+      - name: Build signed APK
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        env:
+          NOTIFICATIONFOLD_KEYSTORE_BASE64: ${{ secrets.NOTIFICATIONFOLD_KEYSTORE_BASE64 }}
+          NOTIFICATIONFOLD_STORE_PASSWORD: ${{ secrets.NOTIFICATIONFOLD_STORE_PASSWORD }}
+        run: |
+          if (-not $env:NOTIFICATIONFOLD_KEYSTORE_BASE64 -or -not $env:NOTIFICATIONFOLD_STORE_PASSWORD) {
+            throw 'Configure NOTIFICATIONFOLD_KEYSTORE_BASE64 and NOTIFICATIONFOLD_STORE_PASSWORD in repository Actions secrets.'
+          }
+          $keystore = Join-Path $env:RUNNER_TEMP 'notificationfold.p12'
+          try {
+            [System.IO.File]::WriteAllBytes($keystore, [Convert]::FromBase64String($env:NOTIFICATIONFOLD_KEYSTORE_BASE64))
+            Remove-Item Env:NOTIFICATIONFOLD_KEYSTORE_BASE64
+            ./build.ps1 -AndroidSdkRoot $env:ANDROID_HOME -KeyStorePath $keystore -KeyAlias notificationfold -StorePasswordEnv NOTIFICATIONFOLD_STORE_PASSWORD -KeyPasswordEnv NOTIFICATIONFOLD_STORE_PASSWORD
+          } finally {
+            if (Test-Path -LiteralPath $keystore) { Remove-Item -LiteralPath $keystore }
+            Remove-Item Env:NOTIFICATIONFOLD_KEYSTORE_BASE64, Env:NOTIFICATIONFOLD_STORE_PASSWORD -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload signed APK
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: notificationfold-signed
+          path: dist/notificationfold.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload development APK
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/master'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: notificationfold-development
+          path: dist/notificationfold.apk
+          if-no-files-found: error
+          retention-days: 7
